@@ -1,0 +1,402 @@
+# Flood\_Map README
+
+**Claim:** This folder contains a restart-safe flood modeling pipeline split into four scripts. Each script reads only committed inputs, writes durable outputs, and emits a manifest for the next script. Names use centimeters for readability. All data and calculations use meters.
+
+**Mechanism:** The pipeline executes in hard stages with file-level commits between stages. Each stage scopes `arcpy.env`, verifies saves, builds pyramids and statistics, and restores state.
+
+**Outcome:** Deterministic runs across users and machines. Large rasters complete reliably without in-memory spills or half-written outputs.
+
+---
+
+## Folder contents
+
+```
+Flood_Map/
+  A1_Preprocess_DEM.py
+  A2_Streams_Watersheds.py
+  B1_HAND.py
+  B2_FloodMasks.py
+  README.md
+```
+
+---
+
+## Prerequisites
+
+* ArcGIS Pro 3.4.x or later.
+* Spatial Analyst extension available.
+* An ArcGIS Pro project with a default File Geodatabase set.
+* A LiDAR-derived DEM visible to the project. Example display name: `ADAB_DEM_10cm`.
+* Optional scoping by map and group if your project organizes rasters in named groups.
+
+---
+
+## Units and naming
+
+* Dataset names use centimeters for readability. Example: `ADAB_DEM_10cm`, `Flood10cm`.
+* All datasets and calculations use meters. You do not change code units when you rename layers.
+* If you change resolution or offsets, rename display names to reflect the true values. Example: `ADAB_DEM_50cm`.
+
+---
+
+## Execution order
+
+Run one script per execution. Each script writes a manifest JSON into the project home folder. The next script discovers the latest manifest automatically.
+
+1. **A1\_Preprocess\_DEM.py**
+   Fill → FlowDirection with Drop → FlowAccumulation.
+   Outputs: base hydro rasters and `manifest_A1_*`.
+
+2. **A2\_Streams\_Watersheds.py**
+   Thresholds and combine → StreamLink and StreamOrder → Stream polylines → Watershed rasters and polygons → Zonal statistics.
+   Outputs: channels, streams, watersheds, zonal tables, `manifest_A2_*`.
+
+3. **B1\_HAND.py**
+   HAND from streams and surface using vertical FlowDistance.
+   Outputs: HAND raster and `manifest_B1_*`.
+
+4. **B2\_FloodMasks.py**
+   Geometric HAND masks at 1 cm, 5 cm, 10 cm. Rainfall-equivalent masks by watershed using Curve Number or runoff coefficient.
+   Outputs: masks and polygons, `manifest_B2_*`.
+
+---
+
+## How to run
+
+From the ArcGIS Pro Python window:
+
+```python
+# A1
+exec(open(r"C:\path\to\Flood_Map\A1_Preprocess_DEM.py").read())
+# A2
+exec(open(r"C:\path\to\Flood_Map\A2_Streams_Watersheds.py").read())
+# B1
+exec(open(r"C:\path\to\Flood_Map\B1_HAND.py").read())
+# B2
+exec(open(r"C:\path\to\Flood_Map\B2_FloodMasks.py").read())
+```
+
+Each run reports a log and a manifest path in the Messages pane.
+
+---
+
+## Configuration
+
+Each script exposes constants near the top. Adjust only when the site or dataset changes.
+
+### Common behavior
+
+* `DEM_NAME`: DEM display name. Exact or prefix match, case insensitive. Example: `ADAB_DEM_10cm`.
+* Optional `MAP_NAME` and `GROUP_NAME`: enable nested group resolution when present.
+* No in-memory workspace. All saves are durable. `overwriteOutput` is disabled.
+* Environment scoping per run: `outputCoordinateSystem`, `snapRaster`, `cellSize`, `extent`, `mask`, `workspace`, `scratchWorkspace`.
+
+### Large raster policy
+
+* The scripts auto-select Cloud Raster Format for very large rasters.
+* CRF output folder: `<project home>\crf_outputs`.
+* Size trigger: about one hundred million cells. You can change the threshold in code if needed.
+* Pyramids and statistics build after each save.
+
+### A1\_Preprocess\_DEM.py
+
+* `FILL_Z_LIMIT_M`: vertical limit for Fill. Default 0.10.
+
+### A2\_Streams\_Watersheds.py
+
+* `MICRO_THRESHOLD_M2`: contributing area for micro drainage. Default 2 500.
+* `MAIN_THRESHOLD_M2`: contributing area for main channels. Default 10 000.
+* `SLOPE_WEIGHT_THRESHOLD`: combine weight threshold. Default 500.
+
+### B2\_FloodMasks.py
+
+* `RAINFALL_SET`: rainfall scenarios in meters. Default 0.01, 0.05, 0.10.
+* `RUNOFF_MODE`: `"CN"` for Curve Number or `"C"` for runoff coefficient.
+* `CN_DEFAULT`, `IA_RATIO`, `C_EFF`, `MAX_STAGE_CAP_M`: hydrology controls used for rainfall-equivalent masks.
+
+---
+
+## Inputs and outputs
+
+### A1\_Preprocess\_DEM.py
+
+* **Input**
+  DEM resolved by `DEM_NAME` from the project or default GDB.
+
+* **Outputs**
+  `Fill_ADAB_DEM_10cm`
+  `FlowDir_ADAB_DEM_10cm`
+  `Drop_FlowDir_ADAB_DEM_10cm`
+  `FlowAcc_ADAB_DEM_10cm`
+  `manifest_A1_<timestamp>.json` with absolute paths and `cell_area_m2`.
+
+* **Rules**
+  Uses DEM spatial reference, snap, cell size, and extent. Builds pyramids and statistics. Restores environment on exit.
+
+---
+
+### A2\_Streams\_Watersheds.py
+
+* **Inputs**
+  `manifest_A1_*` for Fill, FlowDir, Drop, FlowAcc, `cell_area_m2`.
+
+* **Outputs**
+  `Micro_drainage`, `Main_channels`, `Slope_contingent_semi_urban`, `Combine_streamCalcs`
+  `StreamLink_ADAB`, `StreamOrder_ADAB`, `StreamBinary_fc`
+  `Watershed_ADAB` raster and `Watershed_ADAB_fc` polygons
+  `ZonalStats_Watershed_streams`, `ZonalStats_Watershed_slope`
+  `manifest_A2_<timestamp>.json`
+
+* **Rules**
+  Exact grid alignment with A1 outputs. No temp edits to sources.
+
+---
+
+### B1\_HAND.py
+
+* **Inputs**
+  `manifest_A2_*` for StreamLink and FlowDir. The surface is resolved from A2 or from `manifest_A1_*`.
+
+* **Outputs**
+  `HAND50cm` raster
+  `manifest_B1_<timestamp>.json` with HAND and watershed paths
+
+* **Rules**
+  Uses `FlowDistance_sa` with vertical distance. Falls back to `MEAN` statistics if `WEIGHTED_MEAN` is unsupported by the engine on the dataset.
+
+---
+
+### B2\_FloodMasks.py
+
+* **Inputs**
+  `manifest_B1_*` for HAND and Watershed rasters.
+
+* **Outputs**
+  Geometric masks: `Flood01cm`, `Flood05cm`, `Flood10cm`, plus `Flood10cm_fc`
+  Rainfall masks: `Flood01cmRain`, `Flood05cmRain`, `Flood10cmRain`, plus `Flood10cmRain_fc`
+  `manifest_B2_<timestamp>.json`
+
+* **Rules**
+  Validates grid alignment between HAND and Watershed. Per-watershed stage solve for rainfall masks. All thresholds expressed in meters.
+
+---
+
+## Manifests and logs
+
+* Each script writes a manifest JSON to the project home folder with absolute paths.
+* Each script writes a timestamped log file to the project home folder.
+* Use the latest manifest to resume or to audit provenance.
+
+---
+
+## Failure handling
+
+* If a run fails, open the log referenced in the Messages pane.
+* Fix the condition. Re-run the same script. Outputs use unique names, so reruns are safe.
+* Proceed to the next script only after a successful manifest is present.
+
+---
+
+## Performance guidance
+
+* Place the default GDB and `crf_outputs` on fast local storage.
+* Set the parallel processing factor to a value that matches your hardware. The default is suitable for workstations with at least 64 GB RAM.
+* Keep `FILL_Z_LIMIT_M` close to the DEM vertical noise to avoid excessive filling.
+
+---
+
+## Validation checklist
+
+1. Default GDB exists and is writable.
+2. DEM resolves by `DEM_NAME`.
+3. Spatial Analyst is available.
+4. A1 produced a manifest and the four base rasters.
+5. A2 produced channels, streams, watersheds, and a manifest.
+6. B1 produced HAND and a manifest.
+7. B2 produced masks, polygons, and a manifest.
+8. Logs show pyramids and statistics built for all rasters.
+
+# Final outputs: what you are seeing
+
+### A1 outputs — hydro primitives
+
+**Fill\_ADAB\_DEM\_10cm**
+
+* Type: raster (.crf for large datasets or FGDB raster).
+* Meaning: depressionless elevation surface in meters.
+* Pixel values: elevation meters.
+* Use: base surface for all downstream hydrology.
+* QC: no NoData inside the processing extent. Compare min and max to source DEM.
+
+**FlowDir\_ADAB\_DEM\_10cm**
+
+* Type: raster.
+* Meaning: D8 flow direction code per cell.
+* Pixel values: Esri D8 codes {1, 2, 4, 8, 16, 32, 64, 128}.
+* Use: routing for accumulation, streams, and HAND.
+* QC: no flat areas except intentional.
+
+**Drop\_FlowDir\_ADAB\_DEM\_10cm**
+
+* Type: raster.
+* Meaning: elevation drop from a cell to its downslope neighbor in meters.
+* Pixel values: meters.
+* Use: channel weighting and quality screens in A2.
+* QC: expect near zero in flats and large values in steep cells; no negatives after cleaning.
+
+**FlowAcc\_ADAB\_DEM\_10cm**
+
+* Type: raster.
+* Meaning: upslope cell count accumulated to each cell.
+* Pixel values: count of cells.
+* Use: converted to contributing area in A2.
+* QC: maxima at channel heads and outlets; zeros at ridges.
+
+---
+
+### A2 outputs — channels and basins
+
+**Micro\_drainage**
+
+* Type: raster.
+* Meaning: binary mask of cells with contributing area ≥ MICRO\_THRESHOLD\_M2.
+* Pixel values: 1 = micro drainage, 0 = background.
+* Use: candidate minor channels.
+
+**Main\_channels**
+
+* Type: raster.
+* Meaning: binary mask of cells with contributing area ≥ MAIN\_THRESHOLD\_M2.
+* Pixel values: 1 = main channel, 0 = background.
+* Use: candidate primary channels.
+
+**Slope\_contingent\_semi\_urban**
+
+* Type: raster.
+* Meaning: binary mask where weighted drop and area exceed threshold.
+* Pixel values: 1 = slope contingent channel cell, 0 = background.
+* Use: supplements Micro and Main in built environments.
+
+**Combine\_streamCalcs**
+
+* Type: raster.
+* Meaning: majority combine of Micro, Main, and Slope contingent.
+* Pixel values: 1 = channel cell selected by rules, 0 = background.
+* Use: input to StreamLink and StreamOrder.
+
+**StreamLink\_ADAB**
+
+* Type: raster.
+* Meaning: unique ID per channel segment.
+* Pixel values: integer segment IDs.
+* Use: watershed delineation and vectorization control.
+
+**StreamOrder\_ADAB**
+
+* Type: raster.
+* Meaning: Shreve stream order of each channel cell.
+* Pixel values: integer order.
+* Use: network analysis and cartographic hierarchy.
+
+**StreamBinary\_fc**
+
+* Type: feature class (polyline).
+* Meaning: vector channels created from Combine and FlowDir.
+* Fields: default geometry fields and gridcode = 1.
+* Use: map display and network overlays.
+
+**Watershed\_ADAB**
+
+* Type: raster.
+* Meaning: watershed ID for every channel cell domain.
+* Pixel values: integer basin IDs.
+* Use: zonal operations and rainfall volume allocation.
+
+**Watershed\_ADAB\_fc**
+
+* Type: feature class (polygon).
+* Meaning: basin polygons converted from Watershed raster.
+* Fields: gridcode = basin ID plus geometry fields.
+* Use: reporting, joins to zonal stats, and labeling.
+
+**ZonalStats\_Watershed\_streams** and **ZonalStats\_Watershed\_slope**
+
+* Type: tables.
+* Meaning: per basin statistics used for QA.
+* Fields: VALUE or gridcode as basin key with summary fields such as MAXIMUM or MEAN.
+* Use: verify combine behavior and slope contribution.
+
+---
+
+### B1 output — HAND surface
+
+**HAND50cm**
+
+* Type: raster (.crf for large datasets or FGDB raster).
+* Meaning: vertical distance from each cell to the channel network in meters.
+* Pixel values: meters above nearest stream path along the flow path.
+* Use: stage based inundation and rainfall volume to stage conversion.
+* QC: zero at streams; monotonic increase away from channels; aligned to Watershed raster.
+
+---
+
+### B2 outputs — flood maps
+
+**Flood01cm**, **Flood05cm**, **Flood10cm**
+
+* Type: rasters.
+* Meaning: geometric masks where HAND ≤ 0.01 m, 0.05 m, and 0.10 m.
+* Pixel values: 1 = inundated at or below the stated stage, 0 = dry.
+* Use: rapid what-if flood zones at fixed stages.
+* QC: masks nest monotonically. Flood10cm covers Flood05cm which covers Flood01cm.
+
+**Flood10cm\_fc**
+
+* Type: feature class (polygon).
+* Meaning: vectorization of Flood10cm for mapping and reporting.
+* Fields: gridcode = 1 indicates inundated polygon; geometry fields supply area and length.
+* Use: area summaries, intersections with assets, and labeling.
+
+**Flood01cmRain**, **Flood05cmRain**, **Flood10cmRain**
+
+* Type: rasters.
+* Meaning: rainfall-equivalent inundation masks solved per watershed.
+* Mechanism: convert rainfall depth to runoff depth using the configured hydrologic model, compute a basin stage threshold that yields the same water volume over the basin, and threshold HAND at that stage.
+* Pixel values: 1 = inundated under the rainfall scenario, 0 = dry.
+* Use: event based mapping and planning where water volume matters, not just stage.
+* QC: inspect the companion threshold raster Hthresh\_\* in the workspace if present, confirm basin alignment and stage reasonableness.
+
+**Flood10cmRain\_fc**
+
+* Type: feature class (polygon).
+* Meaning: vectorization of Flood10cmRain for reporting.
+* Fields: gridcode = 1; geometry fields supply area and length.
+* Use: communication products and impact summaries.
+
+---
+
+### Spatial reference, resolution, and format
+
+* Spatial reference follows the DEM.
+* Cell size follows the DEM.
+* Large rasters may save as Cloud Raster Format in the project home under `crf_outputs`.
+* Smaller rasters save into the project default geodatabase.
+* Feature classes and tables save into the project default geodatabase.
+
+---
+
+### Reading values and legend guidance
+
+* Raster masks use 1 for inundated and 0 for non inundated.
+* HAND values are meters. Use a sequential ramp from 0 to an upper cut, for example 0 to 1 m.
+* Stream order is integer. Classify with natural breaks or unique values.
+
+---
+
+### Minimal QA checklist on delivery
+
+1. Confirm HAND aligns pixel for pixel with Watershed raster.
+2. Confirm geometric masks are nested.
+3. Confirm rainfall masks are equal to or larger than the corresponding geometric masks only when the computed basin stage exceeds the geometric threshold.
+4. Confirm polygon layers carry gridcode = 1 and dissolve correctly if required for area totals.
+5. Open the most recent manifests to verify provenance and paths for every displayed layer.

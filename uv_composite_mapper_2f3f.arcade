@@ -1,0 +1,91 @@
+/* SPDX-License-Identifier: MIT
+   Copyright (c) 2025 Nathanael Sheean */
+/* =============================================================================
+File: uv_composite_mapper_2f3f.arcade
+Author: Nathanael Sheean
+Version: 1.0.0
+Date: 2025-09-14
+
+Purpose:
+  Produce stable Unique Values categories from two or three attributes.
+
+Safety rules:
+  1) Edit only CONFIG and MAP blocks.
+  2) If a configured field is absent or empty, return DEFAULT_LABEL.
+  3) Keys in MAP blocks must use normalized values as defined by norm().
+  4) Keep DEFAULT_LABEL distinct for QC reviews.
+  5) If USE_THREE_FIELDS is true, define MAP_3F keys and ensure FIELD_C is set.
+
+How to apply (ArcGIS Pro):
+  Symbology → Unique Values → Field 1 → Expression (fx) → paste this file.
+  Edit CONFIG fields and MAP tables. Click “Add all values”.
+============================================================================= */
+
+/* =============================== CONFIG ==================================== */
+var FIELD_A = "roadSectionType";     // example. set to your schema.
+var FIELD_B = "owner";               // example. set to your schema.
+var FIELD_C = "operationalStatus";   // optional third field.
+
+var USE_THREE_FIELDS = false;        // true uses FIELD_C and MAP_3F.
+var DEFAULT_LABEL    = "Other";      // fallback label.
+var COLLAPSE_SPACES  = false;        // true turns "Host Nation" into "hostnation".
+
+/* Example 2-field mapping: keys are "normalizedA|normalizedB" */
+var MAP_2F = {
+  // "arterial|usaf": "Arterial + USAF",
+  // "local|host nation": "Local + Host Nation"
+};
+
+/* Example 3-field mapping: keys are "normalizedA|normalizedB|normalizedC" */
+var MAP_3F = {
+  // "arterial|usaf|serviceable": "Arterial + USAF + Serviceable",
+  // "arterial|usaf|abandoned":   "Arterial + USAF + Abandoned"
+};
+/* ============================ END CONFIG =================================== */
+
+/* ---------- Helpers: safe reads, normalization, and keying ---------- */
+// Prefer domain label when present; fall back to raw attribute.
+// Uses Attribute() to avoid hard-coded field references.
+function readWithDomain(feat, fieldName){
+  var label = DomainName(feat, fieldName);
+  return IIF(IsEmpty(label), Attribute(feat, fieldName), label);
+}
+
+// Normalize to text, trim, optional space collapse, lower.
+function norm(v){
+  var s = Text(DefaultValue(v, ""));
+  s = Trim(s);
+  if (COLLAPSE_SPACES){
+    s = Replace(s, " ", "");
+  }
+  return Lower(s);
+}
+
+// Join normalized parts with a stable delimiter.
+function keyJoin(arr){
+  return Concatenate(arr, "|");
+}
+
+/* ----------------- Read, normalize, and key construction ----------------- */
+var a_raw = readWithDomain($feature, FIELD_A);
+var b_raw = readWithDomain($feature, FIELD_B);
+var c_raw = USE_THREE_FIELDS ? readWithDomain($feature, FIELD_C) : "";
+
+var a = norm(a_raw);
+var b = norm(b_raw);
+var c = USE_THREE_FIELDS ? norm(c_raw) : "";
+
+// Early safety checks: empty inputs route to DEFAULT_LABEL.
+if (IsEmpty(a) || IsEmpty(b)){
+  return DEFAULT_LABEL;
+}
+if (USE_THREE_FIELDS && IsEmpty(c)){
+  return DEFAULT_LABEL;
+}
+
+// Build key and mapping reference.
+var key = USE_THREE_FIELDS ? keyJoin([a, b, c]) : keyJoin([a, b]);
+var map = USE_THREE_FIELDS ? MAP_3F : MAP_2F;
+
+/* ------------------------------ Lookup ----------------------------------- */
+IIf(HasKey(map, key), map[key], DEFAULT_LABEL)
