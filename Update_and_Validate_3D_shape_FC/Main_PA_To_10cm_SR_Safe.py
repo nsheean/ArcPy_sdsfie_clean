@@ -5,12 +5,13 @@
 ===================================================================================
 Script: Main_PA_To_10cm_SR_Safe.py
 Author: Nathanael Sheean
-Date: 2025-09-14
-Version: 2.0.1 (Cross-user QC)
+Date: 2025-09-15
+Version: 2.1.0 (Curve-Safe, XY-Identity Audit)
 
 Purpose:
   Update Z-values for CIP layers using a LiDAR-derived base DEM only.
   Route all *_P, *_A, *_L features to the base surface. No offset surfaces here.
+  Preserve geometry shape. Update Z only.
 
 Scope (group-scoped, nested-group aware):
   - Processes ONLY layers contained in the group '{BASE_CODE}_UTM40N' and all subgroups.
@@ -18,33 +19,25 @@ Scope (group-scoped, nested-group aware):
 
 Required raster (LiDAR-derived DEM; naming in centimeters for clarity, data in meters):
   - {BASE_CODE}_DEM_10cm
-    Meaning: base DEM built from LiDAR. The name encodes 10 cm cell size for re{BASE_CODE}ility.
-    Units: the dataset and all calculations use meters.
-
-Raster naming convention and renaming rules:
-  - Use centimeters in the name to describe resolution. Keep data and math in meters.
-  - If you use a different resolution, rename the layer accordingly and update RASTER_BASE_NAME.
-    Examples:
-      • 25 cm cell size: {BASE_CODE}_DEM_25cm
-      • 50 cm cell size: {BASE_CODE}_DEM_50cm
-  - This main CIP script uses only the base surface. It does not use PLUS/MINUS variants.
 
 Routing rules (CIP only):
-  - Feature class suffixes *_P, *_A, *_L → use BASE DEM (e.g., {BASE_CODE}_DEM_10cm).
+  - Feature class suffixes *_P, *_A, *_L → use BASE DEM.
 
 Safety:
   - Requires 3D Analyst. Checks out/in license.
   - Honors nested groups; validates Z-awareness before updates.
-  - Geographic transformation is scoped per operation; no global env side effects.
+  - Skips any dataset or feature that contains true curves to avoid linearization.
+  - XY identity audit for non-curve polylines and polygons. Part and vertex counts must match.
+  - Geographic transformation is scoped per operation. No global env side effects.
   - No deletes, no appends, no temp writes to sources.
 
 QC Logging (written to project home folder; fallback to arcpy.env.scratchFolder):
-  1) <stamp>_main_layers_resolved.csv  — inventory of resolved CIP layers
-  2) <stamp>_main_updates_applied.csv  — each update attempt, raster, counts, status
-  3) <stamp>_Main_PA_To_10cm_SR_Safe.log — human-re{BASE_CODE}le log
+  1) <stamp>_main_layers_resolved.csv   — inventory of resolved CIP layers
+  2) <stamp>_main_updates_applied.csv   — each update attempt, raster, counts, status, audit
+  3) <stamp>_Main_PA_To_10cm_SR_Safe.log — human-readable log
 
 Separation of concerns:
-  - This script is for CIP layers under '{BASE_CODE}_UTM40N'.
+  - This script targets CIP layers under '{BASE_CODE}_UTM40N'.
   - Utilities with vertical offsets and exemptions run in:
       'Utilities_All_With_Exemption_SR_Safe.py'
 ===================================================================================
@@ -59,12 +52,8 @@ from contextlib import contextmanager
 
 # -------------------------- Configuration --------------------------
 GROUP_NAME           = "{BASE_CODE}_UTM40N"
-
-# Base DEM display name (exact or prefix match; case-insensitive)
 RASTER_BASE_NAME     = "{BASE_CODE}_DEM_10cm"
-
-# Geographic transformation to use when projecting on-the-fly (string or empty).
-GEOGRAPHIC_TRANSFORM = ""
+GEOGRAPHIC_TRANSFORM = ""   # e.g., "WGS_1984_(ITRF00)_To_NAD_1983"
 
 # -------------------------- Utilities ------------------------------
 def _now_stamp():
@@ -120,7 +109,6 @@ def _iter_feature_layers(group_layer):
             for sub in _iter_feature_layers(child):
                 yield sub
         else:
-            # Some composite layers expose listLayers()
             try:
                 subs = child.listLayers()
                 if subs:
@@ -149,13 +137,13 @@ def _basename_no_ext(path_or_name):
         return ""
     base = os.path.basename(path_or_name)
     name, _ext = os.path.splitext(base)
-    if "." in name:  # strip schema owner
+    if "." in name:
         name = name.split(".")[-1]
     return name
 
 def _shape_type(ds):
     try:
-        return (arcpy.Describe(ds).shapeType or "").lower()  # 'point','polyline','polygon','multipoint'
+        return (arcpy.Describe(ds).shapeType or "").lower()
     except Exception:
         return ""
 
@@ -165,9 +153,15 @@ def _has_z(ds):
     except Exception:
         return False
 
-def _make_feature_layer(src, name, where=None):
-    lyr = arcpy.management.MakeFeatureLayer(src, name, where).getOutput(0)
-    return lyr
+def _dataset_has_curves(ds):
+    try:
+        return bool(getattr(arcpy.Describe(ds), "hasCurves", False))
+    except Exception:
+        return False
+
+def _make_feature_layer_from_layer(layer_obj, name, where=None):
+    # Wrap the existing map layer so we carry selection and definition query forward
+    return arcpy.management.MakeFeatureLayer(layer_obj, name, where).getOutput(0)
 
 def _collect_rasters_recursive(layer, bag):
     try:
@@ -187,23 +181,14 @@ def _collect_rasters_recursive(layer, bag):
         pass
 
 def _resolve_raster_in_group(group_layer, display_name):
-    """
-    Resolve a raster under the given group by:
-      1) exact case-insensitive name match
-      2) prefix match
-    Returns an arcpy.Raster (ready to use).
-    """
     key = display_name.strip().lower()
     rasters = []
     for top in group_layer.listLayers():
         _collect_rasters_recursive(top, rasters)
-
-    # Exact match
     for r in rasters:
         nm = (r.name or "").strip()
         if nm.lower() == key:
             return r
-    # Prefix match
     for r in rasters:
         nm = (r.name or "").strip().lower()
         if nm.startswith(key):
@@ -226,7 +211,6 @@ def _suffix_supported(layer_name):
 
 # -------------------------- Main ------------------------------
 def run():
-    # Context
     aprx, home = _project_context()
     m = aprx.activeMap
     if m is None:
@@ -236,13 +220,16 @@ def run():
     stamp = _now_stamp()
     paths = _log_paths(home, stamp)
 
-    # Log files
     layers_fh, layers_csv = _open_csv(paths["layers"], [
-        "layer_name", "dataset_basename", "catalog_path", "geometry", "has_z"
+        "layer_name", "dataset_basename", "catalog_path", "geometry",
+        "has_z", "dataset_has_curves"
     ])
     updates_fh, updates_csv = _open_csv(paths["updates"], [
         "layer_name", "route", "raster_used",
-        "attempted_count", "status", "message"
+        "attempted_count", "updated_count",
+        "status", "message",
+        "audit_part_count_before", "audit_part_count_after",
+        "audit_vertex_count_before", "audit_vertex_count_after"
     ])
     log_fh = open(paths["textlog"], "w", encoding="utf-8")
     def _wlog(line): log_fh.write(line + "\n"); log_fh.flush()
@@ -259,7 +246,6 @@ def run():
         return
 
     try:
-        # Resolve group and base DEM
         group = _find_group(m, GROUP_NAME)
         base_ras = _resolve_raster_in_group(group, RASTER_BASE_NAME)
 
@@ -269,7 +255,6 @@ def run():
         else:
             _wlog("[INFO] Geographic Transformation: <default/none>")
 
-        # Enumerate CIP feature layers under group
         for lyr in _iter_feature_layers(group):
             cat = _catalog_path(lyr)
             if not cat or not arcpy.Exists(cat):
@@ -279,31 +264,54 @@ def run():
             base = _basename_no_ext(cat)
             geom = _shape_type(lyr)
             hasz = _has_z(lyr)
+            ds_has_curves = _dataset_has_curves(cat)
 
-            # Record discovery
             layers_csv.writerow({
-                "layer_name": lyr.name, "dataset_basename": base,
-                "catalog_path": cat, "geometry": geom, "has_z": hasz
+                "layer_name": lyr.name,
+                "dataset_basename": base,
+                "catalog_path": cat,
+                "geometry": geom,
+                "has_z": hasz,
+                "dataset_has_curves": ds_has_curves
             })
 
-            # Suffix gate
             if not _suffix_supported(lyr.name):
                 _wlog(f"[INFO] Skip (unsupported suffix): {lyr.name}")
                 continue
 
-            # Z-awareness gate
             if not hasz:
                 msg = "not_z_aware; no update attempted"
                 updates_csv.writerow({
                     "layer_name": lyr.name, "route": "BASE",
                     "raster_used": base_ras.name, "attempted_count": 0,
-                    "status": "skipped", "message": msg
+                    "updated_count": 0, "status": "skipped",
+                    "message": msg,
+                    "audit_part_count_before": "", "audit_part_count_after": "",
+                    "audit_vertex_count_before": "", "audit_vertex_count_after": ""
                 })
                 _wlog(f"[INFO] {lyr.name}: {msg}")
                 continue
 
-            # Apply update (always base DEM)
-            _apply_update(src=lyr, raster=base_ras, updates_csv=updates_csv, log=_wlog)
+            if ds_has_curves and geom in ("polyline", "polygon"):
+                msg = "dataset_contains_true_curves; skipped to preserve geometry"
+                updates_csv.writerow({
+                    "layer_name": lyr.name, "route": "BASE",
+                    "raster_used": base_ras.name, "attempted_count": 0,
+                    "updated_count": 0, "status": "skipped_curves",
+                    "message": msg,
+                    "audit_part_count_before": "", "audit_part_count_after": "",
+                    "audit_vertex_count_before": "", "audit_vertex_count_after": ""
+                })
+                _wlog(f"[INFO] {lyr.name}: {msg}")
+                continue
+
+            _apply_update(
+                src_layer=lyr,
+                raster=base_ras,
+                geom_type=geom,
+                updates_csv=updates_csv,
+                log=_wlog
+            )
 
         _add_msg("CIP Z-update processing complete.")
         _add_msg(f"Logs written:\n  {paths['layers']}\n  {paths['updates']}\n  {paths['textlog']}")
@@ -320,78 +328,158 @@ def run():
             pass
         layers_fh.close(); updates_fh.close(); log_fh.close()
 
+def _feature_counts(lyr, geom_type):
+    """Return part_count, vertex_count for current selection."""
+    part_count = 0
+    vertex_count = 0
+    if geom_type in ("point", "multipoint"):
+        try:
+            c = int(arcpy.management.GetCount(lyr).getOutput(0))
+            part_count = c
+            vertex_count = c
+        except Exception:
+            pass
+        return part_count, vertex_count
 
-def _apply_update(src, raster, updates_csv, log):
-    """
-    Apply UpdateFeatureZ_3d to 'src' (layer object) using 'raster'.
-    Returns attempted record count for logging.
-    """
-    lyr = _make_feature_layer(src, f"u_{_now_stamp()}")
+    fields = ["SHAPE@"]  # safe and fast
+    with arcpy.da.SearchCursor(lyr, fields) as cur:
+        for (shape,) in cur:
+            if shape is None:
+                continue
+            try:
+                part_count += len(shape.parts)
+                for part in shape.parts:
+                    for _ in part:
+                        vertex_count += 1
+            except Exception:
+                # Fallback if parts iterator fails
+                try:
+                    vertex_count += shape.pointCount
+                except Exception:
+                    pass
+    return part_count, vertex_count
 
-    # Count attempted features
+def _apply_update(src_layer, raster, geom_type, updates_csv, log):
+    """
+    Apply UpdateFeatureZ_3d to 'src_layer' using 'raster'.
+    Curve-safe: skips any feature with true curves.
+    Audits XY identity by comparing part and vertex counts before and after.
+    """
+    lyr = _make_feature_layer_from_layer(src_layer, f"u_{_now_stamp()}")
+
     try:
         attempted = int(arcpy.management.GetCount(lyr).getOutput(0))
     except Exception:
         attempted = 0
 
     raster_name = getattr(raster, "name", "")
+    layer_name = getattr(src_layer, "name", "<unnamed>")
 
     if attempted == 0:
         updates_csv.writerow({
-            "layer_name": getattr(src, "name", "<unnamed>"),
+            "layer_name": layer_name,
             "route": "BASE",
             "raster_used": raster_name,
-            "attempted_count": attempted,
+            "attempted_count": 0,
+            "updated_count": 0,
             "status": "skipped",
-            "message": "selection_empty"
+            "message": "selection_empty",
+            "audit_part_count_before": "", "audit_part_count_after": "",
+            "audit_vertex_count_before": "", "audit_vertex_count_after": ""
         })
-        log(f"[INFO] {getattr(src,'name','<unnamed>')}: selection empty; raster={raster_name}")
+        log(f"[INFO] {layer_name}: selection empty; raster={raster_name}")
         arcpy.management.Delete(lyr)
-        return 0
+        return
 
-    # Geometry guard (tool supports z-aware points/lines/polys)
-    geom = _shape_type(lyr)
-    if geom not in ("point", "polyline", "polygon", "multipoint"):
-        updates_csv.writerow({
-            "layer_name": getattr(src, "name", "<unnamed>"),
-            "route": "BASE",
-            "raster_used": raster_name,
-            "attempted_count": attempted,
-            "status": "skipped",
-            "message": f"unsupported_geometry:{geom}"
-        })
-        log(f"[INFO] {getattr(src,'name','<unnamed>')}: unsupported geometry '{geom}'")
-        arcpy.management.Delete(lyr)
-        return attempted
+    # Per-feature curve guard for non-point types
+    if geom_type in ("polyline", "polygon"):
+        # If any selected feature has curves, skip entire attempt to avoid partial edits
+        has_curve_feature = False
+        with arcpy.da.SearchCursor(lyr, ["OID@", "SHAPE@"]) as cur:
+            for oid, shp in cur:
+                try:
+                    if shp and shp.hasCurves:
+                        has_curve_feature = True
+                        break
+                except Exception:
+                    continue
+        if has_curve_feature:
+            updates_csv.writerow({
+                "layer_name": layer_name, "route": "BASE",
+                "raster_used": raster_name, "attempted_count": attempted,
+                "updated_count": 0, "status": "skipped_curves",
+                "message": "selection_contains_true_curves; skipped to preserve geometry",
+                "audit_part_count_before": "", "audit_part_count_after": "",
+                "audit_vertex_count_before": "", "audit_vertex_count_after": ""
+            })
+            log(f"[INFO] {layer_name}: selection contains true curves; skipped to preserve geometry")
+            arcpy.management.Delete(lyr)
+            return
 
-    # Scoped transformation (no global side effects)
+    # Pre-audit counts for XY identity check (non-points)
+    parts_before = ""
+    verts_before = ""
+    if geom_type in ("polyline", "polygon"):
+        pb, vb = _feature_counts(lyr, geom_type)
+        parts_before, verts_before = str(pb), str(vb)
+
+    updated_count = 0
     try:
         with _scoped_env(GEOGRAPHIC_TRANSFORM):
             arcpy.ddd.UpdateFeatureZ(in_surface=raster, in_features=lyr)
+        updated_count = attempted
+
+        # Post-audit counts
+        parts_after = ""
+        verts_after = ""
+        if geom_type in ("polyline", "polygon"):
+            pa, va = _feature_counts(lyr, geom_type)
+            parts_after, verts_after = str(pa), str(va)
+
+            # Identity check: part and vertex counts must be equal
+            if parts_before != parts_after or verts_before != verts_after:
+                # Report and mark as error. Geometry change detected.
+                msg = "xy_identity_failed; part_or_vertex_count_changed"
+                updates_csv.writerow({
+                    "layer_name": layer_name, "route": "BASE",
+                    "raster_used": raster_name, "attempted_count": attempted,
+                    "updated_count": 0, "status": "error",
+                    "message": msg,
+                    "audit_part_count_before": parts_before,
+                    "audit_part_count_after": parts_after,
+                    "audit_vertex_count_before": verts_before,
+                    "audit_vertex_count_after": verts_after
+                })
+                log(f"[ERR] {layer_name}: {msg}; raster={raster_name}")
+                arcpy.management.Delete(lyr)
+                return
+
         updates_csv.writerow({
-            "layer_name": getattr(src, "name", "<unnamed>"),
-            "route": "BASE",
-            "raster_used": raster_name,
-            "attempted_count": attempted,
-            "status": "updated",
-            "message": ""
+            "layer_name": layer_name, "route": "BASE",
+            "raster_used": raster_name, "attempted_count": attempted,
+            "updated_count": updated_count, "status": "updated",
+            "message": "",
+            "audit_part_count_before": parts_before,
+            "audit_part_count_after": parts_after if geom_type in ("polyline","polygon") else "",
+            "audit_vertex_count_before": verts_before,
+            "audit_vertex_count_after": verts_after if geom_type in ("polyline","polygon") else ""
         })
-        log(f"[OK] {getattr(src,'name','<unnamed>')}: updated {attempted} features; raster={raster_name}")
+        log(f"[OK] {layer_name}: updated {updated_count} features; raster={raster_name}")
+
     except Exception as e:
         updates_csv.writerow({
-            "layer_name": getattr(src, "name", "<unnamed>"),
-            "route": "BASE",
-            "raster_used": raster_name,
-            "attempted_count": attempted,
-            "status": "error",
-            "message": str(e)
+            "layer_name": layer_name, "route": "BASE",
+            "raster_used": raster_name, "attempted_count": attempted,
+            "updated_count": 0, "status": "error",
+            "message": str(e),
+            "audit_part_count_before": parts_before,
+            "audit_part_count_after": "",
+            "audit_vertex_count_before": verts_before,
+            "audit_vertex_count_after": ""
         })
-        log(f"[ERR] {getattr(src,'name','<unnamed>')}: {e}")
+        log(f"[ERR] {layer_name}: {e}")
     finally:
         arcpy.management.Delete(lyr)
-
-    return attempted
-
 
 if __name__ == "__main__":
     run()
